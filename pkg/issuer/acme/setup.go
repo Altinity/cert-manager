@@ -210,67 +210,81 @@ func (a *Acme) Setup(ctx context.Context) error {
 		}
 	}
 
-	// registerAccount will also verify the account exists if it already
-	// exists.
-	account, err := a.registerAccount(ctx, cl, eabAccount)
-	if err != nil {
-		s := messageAccountVerificationFailed + err.Error()
-		log.Error(err, "failed to verify ACME account")
-		a.recorder.Event(a.issuer, corev1.EventTypeWarning, errorAccountVerificationFailed, s)
-		apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionFalse, errorAccountRegistrationFailed, s)
+	if a.issuer.GetSpec().ACME.DisableAccountKeyGeneration {
+		account, err := cl.GetReg(ctx, "")
+		if err != nil {
+			s := messageAccountVerificationFailed + err.Error()
+			log.Error(err, "failed to verify ACME account")
+			a.recorder.Event(a.issuer, corev1.EventTypeWarning, errorAccountVerificationFailed, s)
+			apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionFalse, errorAccountRegistrationFailed, s)
+			return err
+		}
+		a.issuer.GetStatus().ACMEStatus().URI = account.URI
+		a.issuer.GetStatus().ACMEStatus().LastRegisteredEmail = a.issuer.GetSpec().ACME.Email
+	} else {
+		// registerAccount will also verify the account exists if it already
+		// exists.
+		account, err := a.registerAccount(ctx, cl, eabAccount)
+		if err != nil {
+			s := messageAccountVerificationFailed + err.Error()
+			log.Error(err, "failed to verify ACME account")
+			a.recorder.Event(a.issuer, corev1.EventTypeWarning, errorAccountVerificationFailed, s)
+			apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionFalse, errorAccountRegistrationFailed, s)
 
-		acmeErr, ok := err.(*acmeapi.Error)
-		// If this is not an ACME error, we will simply return it and retry later
-		if !ok {
+			acmeErr, ok := err.(*acmeapi.Error)
+			// If this is not an ACME error, we will simply return it and retry later
+			if !ok {
+				return err
+			}
+
+			// If the status code is 400 (BadRequest), we will *not* retry this registration
+			// as it implies that something about the request (i.e. email address or private key)
+			// is invalid.
+			if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
+				log.Error(acmeErr, "skipping retrying account registration as a "+
+					"BadRequest response was returned from the ACME server")
+				return nil
+			}
+
+			// Otherwise if we receive anything other than a 400, we will retry.
 			return err
 		}
 
-		// If the status code is 400 (BadRequest), we will *not* retry this registration
-		// as it implies that something about the request (i.e. email address or private key)
-		// is invalid.
-		if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
-			log.Error(acmeErr, "skipping retrying account registration as a "+
-				"BadRequest response was returned from the ACME server")
-			return nil
-		}
+		// if we got an account successfully, we must check if the registered
+		// email is the same as in the issuer spec
+		specEmail := a.issuer.GetSpec().ACME.Email
+		account, registeredEmail, err := ensureEmailUpToDate(ctx, cl, account, specEmail)
+		if err != nil {
+			s := messageAccountUpdateFailed + err.Error()
+			log.Error(err, "failed to update ACME account")
+			a.recorder.Event(a.issuer, corev1.EventTypeWarning, errorAccountUpdateFailed, s)
+			apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionFalse, errorAccountUpdateFailed, s)
 
-		// Otherwise if we receive anything other than a 400, we will retry.
-		return err
-	}
+			acmeErr, ok := err.(*acmeapi.Error)
+			// If this is not an ACME error, we will simply return it and retry later
+			if !ok {
+				return err
+			}
 
-	// if we got an account successfully, we must check if the registered
-	// email is the same as in the issuer spec
-	specEmail := a.issuer.GetSpec().ACME.Email
-	account, registeredEmail, err := ensureEmailUpToDate(ctx, cl, account, specEmail)
-	if err != nil {
-		s := messageAccountUpdateFailed + err.Error()
-		log.Error(err, "failed to update ACME account")
-		a.recorder.Event(a.issuer, corev1.EventTypeWarning, errorAccountUpdateFailed, s)
-		apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionFalse, errorAccountUpdateFailed, s)
+			// If the status code is 400 (BadRequest), we will *not* retry this registration
+			// as it implies that something about the request (i.e. email address or private key)
+			// is invalid.
+			if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
+				log.Error(acmeErr, "skipping updating account email as a "+
+					"BadRequest response was returned from the ACME server")
+				return nil
+			}
 
-		acmeErr, ok := err.(*acmeapi.Error)
-		// If this is not an ACME error, we will simply return it and retry later
-		if !ok {
+			// Otherwise if we receive anything other than a 400, we will retry.
 			return err
 		}
 
-		// If the status code is 400 (BadRequest), we will *not* retry this registration
-		// as it implies that something about the request (i.e. email address or private key)
-		// is invalid.
-		if acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 {
-			log.Error(acmeErr, "skipping updating account email as a "+
-				"BadRequest response was returned from the ACME server")
-			return nil
-		}
-
-		// Otherwise if we receive anything other than a 400, we will retry.
-		return err
+		a.issuer.GetStatus().ACMEStatus().URI = account.URI
+		a.issuer.GetStatus().ACMEStatus().LastRegisteredEmail = registeredEmail
+		log.V(logf.InfoLevel).Info("verified existing registration with ACME server")
 	}
 
-	log.V(logf.InfoLevel).Info("verified existing registration with ACME server")
 	apiutil.SetIssuerCondition(a.issuer, v1.IssuerConditionReady, cmmeta.ConditionTrue, successAccountRegistered, messageAccountRegistered)
-	a.issuer.GetStatus().ACMEStatus().URI = account.URI
-	a.issuer.GetStatus().ACMEStatus().LastRegisteredEmail = registeredEmail
 	// ensure the cached client in the account registry is up to date
 	a.accountRegistry.AddClient(httpClient, string(a.issuer.GetUID()), *a.issuer.GetSpec().ACME, rsaPk)
 
